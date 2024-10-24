@@ -1,102 +1,81 @@
-using System;
-using System.IO;
-using System.Security;
+name: Deploy .NET App to IIS with Backup
 
-namespace PasswordSetter
-{
-    class Program
-    {
-        // Define global variables
-        private static string safeNetHouston = @"H:\dev_mabogan\DD_Script\";
-        private static string s1FileName = "dd_dbpu_s1.Key";
-        private static string s2FileName = "dd_dbpu_s2.Key";
-        private static string split;
-        private static SecureString half;
+on:
+  push:
+    branches:
+      - main  # Trigger the workflow on push to the main branch
 
-        static void Main(string[] args)
-        {
-            // Prompt for user input
-            Console.Write("Which half? s1 or s2: ");
-            split = Console.ReadLine();
+jobs:
+  deploy:
+    runs-on: windows-latest
 
-            Console.Write("Enter password half: ");
-            half = GetSecureStringFromConsole();
+    steps:
+      # Step 1: Checkout the code
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-            // Validate parameters and handle the input
-            ValidateParameters();
-        }
+      # Step 2: Set up .NET SDK
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '7.x'  # Specify your .NET version
 
-        static void ValidateParameters()
-        {
-            switch (split)
-            {
-                case "s1":
-                    if (half.Length != 12)
-                    {
-                        Console.WriteLine("s1 password length must equal 12");
-                    }
-                    else
-                    {
-                        SaveSecurePassword(half, Path.Combine(safeNetHouston, s1FileName));
-                        Console.WriteLine("Password set successfully");
-                    }
-                    break;
+      # Step 3: Restore dependencies
+      - name: Restore dependencies
+        run: dotnet restore
 
-                case "s2":
-                    if (half.Length != 13)
-                    {
-                        Console.WriteLine("s2 password length must equal 13");
-                    }
-                    else
-                    {
-                        SaveSecurePassword(half, Path.Combine(safeNetHouston, s2FileName));
-                        Console.WriteLine("Password set successfully");
-                    }
-                    break;
+      # Step 4: Build the .NET app
+      - name: Build .NET app
+        run: dotnet build --configuration Release --no-restore
 
-                default:
-                    Console.WriteLine("Incorrect input");
-                    Console.WriteLine("Enter s1 or s2 at which half? prompt, password at password prompt");
-                    break;
+      # Step 5: Publish the app
+      - name: Publish .NET app
+        run: dotnet publish -c Release -o ./publish
+
+      # Step 6: Stop IIS, Backup, Deploy, Start IIS (PowerShell via WinRM)
+      - name: Stop IIS and Backup/Deploy via PowerShell
+        uses: microsoft/powershell-action@v1
+        with:
+          script: |
+            # Step 1: Start a PSSession to the IIS server
+            $securePassword = ConvertTo-SecureString $env:WINRM_PASSWORD -AsPlainText -Force
+            $credential = New-Object System.Management.Automation.PSCredential ($env:WINRM_USERNAME, $securePassword)
+            $session = New-PSSession -ComputerName $env:WINRM_HOST -Credential $credential
+
+            # Step 2: Stop IIS on the remote server
+            Invoke-Command -Session $session -ScriptBlock {
+              Stop-Service -Name 'W3SVC'
+              Write-Host 'IIS stopped.'
             }
-        }
 
-        static SecureString GetSecureStringFromConsole()
-        {
-            SecureString secureString = new SecureString();
-            while (true)
-            {
-                ConsoleKeyInfo keyInfo = Console.ReadKey(intercept: true);
-                if (keyInfo.Key == ConsoleKey.Enter)
-                    break;
-                if (keyInfo.Key == ConsoleKey.Backspace && secureString.Length > 0)
-                {
-                    secureString.RemoveAt(secureString.Length - 1);
-                    Console.Write("\b \b");
-                }
-                else if (!char.IsControl(keyInfo.KeyChar))
-                {
-                    secureString.AppendChar(keyInfo.KeyChar);
-                    Console.Write("*");
-                }
+            # Step 3: Backup the existing folder with timestamp
+            Invoke-Command -Session $session -ScriptBlock {
+              $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+              $backupPath = "F:\Backup\MagnumAF\MagnumAF_$timestamp.zip"
+              $sourcePath = "F:\Webdata\MagnumAF"
+              Add-Type -AssemblyName 'System.IO.Compression.FileSystem'
+              [System.IO.Compression.ZipFile]::CreateFromDirectory($sourcePath, $backupPath)
+              Write-Host "Backup completed: $backupPath"
             }
-            secureString.MakeReadOnly();
-            Console.WriteLine();
-            return secureString;
-        }
 
-        static void SaveSecurePassword(SecureString secureString, string filePath)
-        {
-            IntPtr bstr = Marshal.SecureStringToBSTR(secureString);
-            try
-            {
-                string encryptedPassword = Marshal.PtrToStringBSTR(bstr);
-                File.WriteAllText(filePath, encryptedPassword);
+            # Step 4: Deploy the new build (Copy artifacts)
+            Invoke-Command -Session $session -ScriptBlock {
+              $publishPath = "$PWD\publish" # Assuming the publish path is in the current working directory
+              $destinationPath = "F:\Webdata\MagnumAF"
+              Remove-Item -Recurse -Force -Path $destinationPath\*  # Clean destination folder
+              Copy-Item -Recurse -Force -Path $publishPath\* -Destination $destinationPath
+              Write-Host "Deployment completed: $publishPath to $destinationPath"
             }
-            finally
-            {
-                Marshal.ZeroFreeBSTR(bstr);
+
+            # Step 5: Start IIS
+            Invoke-Command -Session $session -ScriptBlock {
+              Start-Service -Name 'W3SVC'
+              Write-Host 'IIS started.'
             }
-        }
-    }
-}
+
+            # Step 6: Remove the PSSession
+            Remove-PSSession $session
+        env:
+          WINRM_USERNAME: ${{ secrets.WINRM_USERNAME }}
+          WINRM_PASSWORD: ${{ secrets.WINRM_PASSWORD }}
+          WINRM_HOST: ${{ secrets.WINRM_HOST }}
